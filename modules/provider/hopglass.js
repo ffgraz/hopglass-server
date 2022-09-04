@@ -113,8 +113,22 @@ module.exports = function(receiver, config) {
     const nodeTable = {}
     const macTable = {}
     const typeTable = {}
+    const ipTable = {}
     let counter = 0
     function createEntry(mac) {
+      if (macTable[mac] && mac) {
+        // this is a shitty hack for our other shitty hacks
+        // this just aliases nodes that we already created
+        // if our code failed to do so
+        for (let i = 0; i < gJson.batadv.nodes.length; i++) {
+          const node = gJson.batadv.nodes[i]
+          if (node.node_id === macTable[mac]) {
+            nodeTable[mac] = i
+            return
+          }
+        }
+      }
+
       const nodeEntry = {}
       nodeEntry.id = mac
       nodeEntry.node_id = macTable[mac]
@@ -143,6 +157,10 @@ module.exports = function(receiver, config) {
         for (const mac in n.neighbours.batadv) {
           macTable[mac] = k
         }
+      if (_.has(n, 'neighbours.batadv') && _.has(n, 'nodeinfo.network.addresses'))
+        for (const ip of n.nodeinfo.network.addresses) {
+          ipTable[ip.replace(/\/\d+/g, '')] = k
+        }
       if (_.has(n, 'nodeinfo.network.mesh'))
         for (const bat in n.nodeinfo.network.mesh) {
           for (const type in n.nodeinfo.network.mesh[bat].interfaces) {
@@ -157,9 +175,20 @@ module.exports = function(receiver, config) {
     }, function() {
       async.forEachOf(data, function(n, k, finished2) {
         if (_.has(n, 'neighbours.batadv') && isOnline(n)) {
-          for (const dest in n.neighbours.batadv) {
+          for (let dest in n.neighbours.batadv) {
             if (_.has(n.neighbours.batadv[dest], 'neighbours'))
-              for (const src in n.neighbours.batadv[dest].neighbours) {
+              for (let src in n.neighbours.batadv[dest].neighbours) {
+                const ip = n.neighbours.batadv[dest].neighbours[src].olsr1_ip || n.neighbours.batadv[dest].neighbours[src].ip || n.neighbours.batadv[dest].neighbours[src].olsr2_ip
+
+                if (!macTable[src]) {
+                  if (ipTable[ip]) {
+                    macTable[src] = ipTable[ip]
+                    if (macTable[ipTable[ip]]) { // this avoids *some* duplicates, where it's easy
+                      src = ipTable[ip]
+                    }
+                  }
+                }
+
                 const link = {}
                 link.source = nodeTable[src]
                 link.target = nodeTable[dest]
@@ -167,7 +196,16 @@ module.exports = function(receiver, config) {
                 link.tq = 255 / (tq ? tq : 1)
 
                 const ts = typeTable[src], td = typeTable[dest]
-                if (ts === 'l2tp' || td === 'l2tp') {
+                if (ip.startsWith('10.12.11.') || ip === '2001:470:508d::12') {
+                  // force tunnels for everything that's very clearly vpn
+                  // some gateway links are also affected, but that clears the map up a bit
+                  // so that's a feature not a bug
+                  // (maybe we still want this, as the gw position in graph map
+                  // doesn't follow vpn clients)
+                  link.type = 'tunnel'
+                  typeTable[src] = 'tunnel'
+                  typeTable[dest] = 'tunnel'
+                } else if (ts === 'l2tp' || td === 'l2tp') {
                   link.type = 'l2tp'
                 } else if (ts === 'fastd' || td === 'fastd') {
                   link.type = 'fastd'
@@ -185,8 +223,19 @@ module.exports = function(receiver, config) {
                     if (sis == fds && fds > 0) link.type = 'fastd'
                     if (sis == tds && tds > 0) link.type = 'l2tp'
                   }
-                } else
-                  link.type = typeTable[dest]
+                } else {
+                  if (dest.match(/^manman\.\d+$/)) { // if dest is unspecific, then use source
+                    link.type = typeTable[src]
+                  } else {
+                    link.type = typeTable[dest]
+                  }
+                }
+
+                const manlong = /^(manman\.\d+)\.\d+$/
+                if (src.match(manlong)) {
+                  src = src.replace(manlong, (_, short) => short)
+                }
+                link.source = nodeTable[src]
 
                 if (isNaN(link.source)) {
                   //unknown node (not in data) -> create nodeentry
